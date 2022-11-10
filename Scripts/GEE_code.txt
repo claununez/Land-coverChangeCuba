@@ -1,0 +1,410 @@
+GOOGLE EARTH ENGINE
+
+ANALYSIS 1985
+
+// ----------------------------------------------------------------------------------------
+// 1. INPUT CONFIGURATION
+// ----------------------------------------------------------------------------------------
+ 
+var NameSector = 'Cuba'; // Name of the location
+var folderName = 'GEE_Cuba'; // Working directory
+var YearAnalysis = '1985';
+var l5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2'); // Collection 
+
+// ----------------------------------------------------------------------------------------
+// 2. VIEW POLYGON OF INTEREST
+// ----------------------------------------------------------------------------------------
+
+// Create an empty image into which to paint the features, cast to byte.
+var empty = ee.Image().byte();
+
+var outline = empty.paint({
+  featureCollection: polygon,
+  color: 1,
+  width: 3
+});
+
+Map.addLayer(outline, {palette: '00800a'}, 'Polygons Interest'); // Show map
+Map.centerObject(polygon,8); // Zoom map
+
+// ----------------------------------------------------------------------------------------
+// 3. CLOUD MASK FUNCTION
+// ----------------------------------------------------------------------------------------
+
+// Function to filter the clouds 
+function maskL5srClouds(image){
+  // Bits 3 and 5 are cloud shadow and cloud, respectively.
+  var cloudShadowBitMask = (1 << 3);
+  var cloudsBitMask = (1 << 5);
+  // Get the pixel QA band.
+  var qa = image.select('QA_PIXEL');
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+                .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return image.updateMask(mask);
+}
+
+// Composite scenes list
+var l5compositeList = l5.filterBounds(polygon)
+                .filterDate('1984-01-01','1988-12-31')
+                .filterMetadata('CLOUD_COVER','less_than',25);
+  
+print("Number of scenes:", l5compositeList.size());
+print("List of scenes:", l5compositeList);
+
+// Composite image with filters
+var l5compositeMasked = l5.filterBounds(polygon)
+                .filterDate('1984-01-01','1988-12-31')
+                .filterMetadata('CLOUD_COVER','less_than',25)
+                .map(maskL5srClouds)
+                .median()
+                .clip(polygon);
+                
+print("L5 composite mask:", l5compositeMasked);
+
+// Add composite to capture ROIS
+Map.addLayer(l5compositeMasked,
+             {bands:['SR_B3','SR_B2','SR_B1'],min:8000,max:15000, gamma:1.5},
+             'L5 composite 321 1985', false);
+
+Map.addLayer(l5compositeMasked,
+             {bands:['SR_B4','SR_B5','SR_B3'],min:8500,max:21500, gamma:1},
+             'L5 composite 453 1985', false);
+             
+// Export Composite
+Export.image.toDrive({
+  image: l5compositeMasked,
+  folder: folderName,
+  description: NameSector+'_'+YearAnalysis+'_Landsat5',
+  scale: 30,
+  maxPixels: 516415800,
+  region: polygon
+});
+
+// ----------------------------------------------------------------------------------------
+// 4. RANDOM FOREST CLASSIFICATION
+// ----------------------------------------------------------------------------------------
+
+// Merge the geometry layers (ROIS) into a single FeatureCollection.
+var newfc = agriculture.merge(forest).merge(mangrove).merge(pinares).merge(SWVC).merge(water).merge(wetlands);//Switch year ROIS 
+print("Number of ROIS:", newfc);
+
+// Select the bands for prediction
+var bands5 = ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7'];
+
+// Sample the input imagery to get a FeatureCollection of training data.
+var training = l5compositeMasked.select(bands5).sampleRegions({
+  collection: newfc,
+  properties: ['landcover'],
+  scale: 30
+});
+
+// The randomColumn() method will add a column of uniform random
+// numbers in a column named 'random' by default.
+var withRandom = training.randomColumn();
+var split = 0.7;  // Roughly 70% training, 30% testing.
+var training_partition = withRandom.filter(ee.Filter.lt('random', split));
+var validation_partition = withRandom.filter(ee.Filter.gte('random', split));
+
+// Make a Random Forest classifier and train it.
+var trainedRF = ee.Classifier.smileRandomForest(10).train({
+  features: training_partition, 
+  classProperty: 'landcover', 
+  inputProperties: bands5,
+});
+// Classify the input imagery.
+var classifiedRF = l5compositeMasked.select(bands5).classify(trainedRF);
+
+// Define a palette for the Land Use classification.
+var palette = [
+  'FDFFAC', // 1. farming : yellow
+  '0B5301', // 2. forest:  green
+  'A44522', // 3. mangrove: brown
+  '95EB89', // 4. pinares: green smooth
+  'FF0000', // 5. SWVC: red
+  '0029FF', // 6. water: blue
+  '716F6F'  // 7. wetlands: gray
+];
+
+// Display the classification result and the input image.
+Map.addLayer(classifiedRF.clip(polygon), 
+            {min: 1, max: 7, palette: palette}, 
+            'ClassRF_'+YearAnalysis, false);
+
+// Export Classification
+var classRF = ee.Image(classifiedRF);
+
+Export.image.toDrive({
+  image: classRF,
+  folder: folderName,
+  description: NameSector+'_'+YearAnalysis+'_RFL5',
+  scale: 30,
+  maxPixels: 516415800,
+  region: polygon
+});
+
+// ----------------------------------------------------------------------------------------
+// 5. ACCURACY ASSESSMENT
+// ----------------------------------------------------------------------------------------
+
+// Get a confusion matrix representing resubstitution accuracy.
+var train_accuracy = trainedRF.confusionMatrix();
+
+print('Train Error Matrix: ', train_accuracy);
+print('Train Overall Accuracy: ', train_accuracy.accuracy());
+print('Train Kappa Coefficient: ', train_accuracy.kappa());
+print('Train Producer Accuracy: ', train_accuracy.producersAccuracy());
+print('Train Consumers Accuracy: ', train_accuracy.consumersAccuracy());
+
+// ----------------------------------------------------------------------------------------
+// 6. VALIDATION CLASSIFICATION
+// ----------------------------------------------------------------------------------------
+
+// Load Random Forest reclassification with majority filter done on QGIS
+Map.addLayer(Majority85.clip(polygon), {min: 1, max: 7, palette: palette}, 'Majority_'+YearAnalysis, true);
+
+// Samples validation
+var fc_validation = v_agriculture.merge(v_forest).merge(v_mangrove).merge(v_pinares).merge(v_SWVC).merge(v_water).merge(v_wetlands);//Switch year ROIS 
+print("Number of points validation:", fc_validation);
+
+var sample_validation = Majority85.sampleRegions({
+  collection: fc_validation,
+  properties: ['v_landcover'],
+  scale: 30
+  });
+
+// Get a confusion matrix representing resubstitution accuracy.
+var validation_accuracy = sample_validation.errorMatrix('v_landcover', 'b1');
+
+print('Validation Error Matrix: ', validation_accuracy);
+print('Validation Overall Accuracy: ', validation_accuracy.accuracy());
+print('Validation Kappa Accuracy: ', validation_accuracy.kappa());
+print('Validation Producer Accuracy: ', validation_accuracy.producersAccuracy());
+print('Validation Consumer Accuracy: ', validation_accuracy.consumersAccuracy());
+
+
+
+ANALISYS 2018
+
+// ----------------------------------------------------------------------------------------
+// 1. INPUT CONFIGURATION
+// ----------------------------------------------------------------------------------------
+
+var NameSector = 'Cuba'; // Name of the location
+var folderName = 'GEE_Cuba';  // Working directory
+var YearAnalysis = '2021';
+var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2'); // Collection 
+
+// ----------------------------------------------------------------------------------------
+// 2. VIEW POLYGON INTEREST
+// ----------------------------------------------------------------------------------------
+ 
+// Create an empty image into which to paint the features, cast to byte.
+var empty = ee.Image().byte();
+
+var outline = empty.paint({
+  featureCollection: polygon,
+  color: 1,
+  width: 3
+});
+
+Map.addLayer(outline, {palette: '00800a'}, 'Polygons Interest'); // Show map
+Map.centerObject(polygon,8); // Zoom map
+
+// ----------------------------------------------------------------------------------------
+// 3. CLOUD MASK FUNCTION
+// ----------------------------------------------------------------------------------------
+
+// Function to cloud filter
+function maskL8srClouds(image){
+  // Bits 3 and 5 are cloud shadow and cloud, respectively.
+  var cloudShadowBitMask = (1 << 3);
+  var cloudsBitMask = (1 << 5);
+  // Get the pixel QA band.
+  var qa = image.select('QA_PIXEL');
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+                .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return image.updateMask(mask);
+}
+
+// Composite scenes list
+var l8compositeList = l8.filterBounds(polygon)
+                .filterDate('2020-01-01','2021-12-31')
+                .filterMetadata('CLOUD_COVER','less_than',50);
+  
+print("Number of scenes:", l8compositeList.size());
+print("List of scenes:", l8compositeList);
+
+// Composite image with filters
+var l8compositeMasked = l8.filterBounds(polygon)
+                .filterDate('2020-01-01','2021-12-31')
+                .filterMetadata('CLOUD_COVER','less_than',50)
+                .map(maskL8srClouds)
+                .median()
+                .clip(polygon);
+ 
+print(l8compositeMasked, "L8 composite mask");
+
+// Add composite to capture ROIS
+Map.addLayer(l8compositeMasked,
+             {bands:['SR_B4','SR_B3','SR_B2'],min:8000,max:15000, gamma:1.5},
+             'L8 composite 432 2021', false);
+
+Map.addLayer(l8compositeMasked,
+             {bands:['SR_B5','SR_B6','SR_B4'],min:8500,max:21000, gamma:0.75},
+             'L8 composite 564 2021', false);
+
+// Export Composite
+Export.image.toDrive({
+  image: l8compositeMasked,
+  folder: folderName,
+  description: NameSector+'_'+YearAnalysis+'_Landsat8',
+  scale: 30,
+  maxPixels: 516415800,
+  shardSize: 50000,
+  region: polygon
+});
+
+// ----------------------------------------------------------------------------------------
+// 4. RANDOM FOREST CLASSIFICATION
+// ---------------------------------------------------------------------------------------------------
+
+// Merge the geometry layers (ROIS) into a single FeatureCollection.
+var newfc = agriculture.merge(forest).merge(mangrove).merge(pinares).merge(SWVC).merge(water).merge(wetlands);//Switch year ROIS 
+print("Number of ROIS:", newfc);
+
+// Select the bands for prediction
+var bands8 = ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'];
+
+// Sample the input imagery to get a FeatureCollection of training data.
+var training = l8compositeMasked.select(bands8).sampleRegions({
+  collection: newfc, 
+  properties: ['landcover'], 
+  scale: 30,
+});
+
+// The randomColumn() method will add a column of uniform random
+// numbers in a column named 'random' by default.
+var withRandom = training.randomColumn();
+var split = 0.7;  // Roughly 70% training, 30% testing.
+var trainingPartition = withRandom.filter(ee.Filter.lt('random', split));
+var testingPartition = withRandom.filter(ee.Filter.gte('random', split));
+
+// Make a Random Forest classifier and train it.
+var trainedRF = ee.Classifier.smileRandomForest(10).train({
+  features: trainingPartition, 
+  classProperty: 'landcover', 
+  inputProperties: bands8,
+});
+
+// Classify the input imagery.
+var classifiedRF = l8compositeMasked.select(bands8).classify(trainedRF);
+
+
+// Define a palette for the Land Use classification.
+var palette = [
+  'FDFFAC', // 1. farming : yellow
+  '0B5301', // 2. forest:  green
+  'A44522', // 3. mangrove: brown
+  '95EB89', // 4. pinares: green smooth
+  'FF0000', // 5. SWVC: red
+  '0029FF', // 6. water: blue
+  '716F6F'  // 7. wetlands: gray
+];
+
+// Display the classification result and the input image.
+Map.addLayer(classifiedRF.clip(polygon),
+            {min: 1, max: 7, palette: palette},
+            'ClassRF_'+YearAnalysis, false);
+            
+// Export Classification
+var classRF = ee.Image(classifiedRF);
+
+Export.image.toDrive({
+  image: classRF,
+  folder: folderName,
+  description: NameSector+'_'+YearAnalysis+'_RFL8',
+  scale: 30,
+  maxPixels: 516415800,
+  shardSize: 50000,
+  region: polygon
+});
+
+// ----------------------------------------------------------------------------------------
+// 5. ACCURACY ASSESSMENT
+// ----------------------------------------------------------------------------------------
+
+// Get a confusion matrix representing resubstitution accuracy.
+var train_accuracy = trainedRF.confusionMatrix();
+
+print('Train Error Matrix: ', train_accuracy);
+print('Train Overall Accuracy: ', train_accuracy.accuracy());
+print('Train Kappa Coefficient: ', train_accuracy.kappa());
+print('Train Producer Accuracy: ', train_accuracy.producersAccuracy());
+print('Train Consumers Accuracy: ', train_accuracy.consumersAccuracy());
+
+// ----------------------------------------------------------------------------------------
+// 6. VALIDATION CLASSIFICATION
+// ----------------------------------------------------------------------------------------
+
+// Load Random Forest classification 1985 with majority filter done on QGIS (Majority85)
+Map.addLayer(Majority21.clip(polygon), {min: 1, max: 7, palette: palette}, 'Majority_'+YearAnalysis, true);
+
+// Samples validation
+var fc_validation = v_agriculture.merge(v_forest).merge(v_mangrove).merge(v_pinares).merge(v_SWVC).merge(v_water).merge(v_wetlands);//Switch year ROIS 
+print("Number of points validation:", fc_validation);
+
+var sample_validation = Majority21.sampleRegions({
+  collection: fc_validation,
+  properties: ['v_landcover'],
+  scale: 30
+  });
+
+// Get a confusion matrix representing resubstitution accuracy.
+var validation_accuracy = sample_validation.errorMatrix('v_landcover', 'b1');
+
+print('Validation Error Matrix: ', validation_accuracy);
+print('Validation Overall Accuracy: ', validation_accuracy.accuracy());
+print('Validation Kappa Accuracy: ', validation_accuracy.kappa());
+print('Validation Producer Accuracy: ', validation_accuracy.producersAccuracy());
+print('Validation Consumer Accuracy: ', validation_accuracy.consumersAccuracy());
+
+
+QGIS (raster calculator)
+
+Reclassification of pixels on 1985 land cover map using elevational considerations
+1. Mangrove pixels >= 20 m above sea level become Pinares
+(("cuba_1985_rfL5_clip@1" != 3) AND ( "srtm@1">= 20)) * "cuba_1985_rfL5_clip@1" + (("cuba_1985_rfL5_clip@1" = 3) AND ( "srtm@1">= 20)) * 4 + (("srtm@1"< 20)) * "cuba_1985_rfL5_clip@1"
+cuba_1985_rfL5_rc1
+2. Wetland pixels >= 11 m above sea level become agriculture
+(("cuba_1985_rfL5_rc1@1" != 7) AND ( "srtm@1">= 11)) * "cuba_1985_rfL5_rc1@1" + (("cuba_1985_rfL5_rc1@1" = 7) AND ( "srtm@1">= 11)) * 1 + (("srtm@1"< 11)) * "cuba_1985_rfL5_rc1@1"
+cuba_1985_rfL5_rc2
+
+3. Pinares pixels <= 20 m above sea level become wetlands
+(("cuba_1985_rfL5_rc2@1" != 4) AND ( "srtm@1"<= 20)) * "cuba_1985_rfL5_rc2@1" + (("cuba_1985_rfL5_rc2@1" = 4) AND ( "srtm@1"<= 20)) * 7 + (("srtm@1" > 20)) * "cuba_1985_rfL5_rc2@1" 
+cuba_1985_rfL5_rc3
+4. Agriculture land pixels <= 4 m above sea level become wetlands
+(("cuba_1985_rfL5_rc3@1" != 1) AND ( "srtm@1"<= 4)) * "cuba_1985_rfL5_rc3@1" + (("cuba_1985_rfL5_rc3@1" = 1) AND ( "srtm@1"<= 4)) * 7 + (("srtm@1" > 4)) * "cuba_1985_rfL5_rc3@1"
+cuba_1985_rfL5_rc4
+5. Water bodies pixels >= 200 m above sea level become forest
+(("cuba_1985_rfL5_rc4@1" != 6) AND ( "srtm@1" >= 200)) * "cuba_1985_rfL5_rc4@1" + (("cuba_1985_rfL5_rc4@1" = 6) AND ( "srtm@1" >= 200)) * 2 + (("srtm@1" < 200)) * "cuba_1985_rfL5_rc4@1"
+cuba_1985_rfL5_rc5
+
+Reclassification of pixels on 2020 land cover map using elevational considerations
+1. Mangrove pixels >= 20 m above sea level become Pinares
+(("cuba_2021_rfL8_clip@1" != 3) AND ( "srtm@1">= 20)) * "cuba_2021_rfL8_clip@1" + (("cuba_2021_rfL8_clip@1" = 3) AND ( "srtm@1">= 20)) * 4 + (("srtm@1"< 20)) * "cuba_2021_rfL8_clip@1"
+cuba_2021_rfL8_rc1
+2. Wetland pixels >= 11 m above sea level become agriculture
+(("cuba_2021_rfL8_rc1@1" != 7) AND ( "srtm@1">= 11)) * "cuba_2021_rfL8_rc1@1" + (("cuba_2021_rfL8_rc1@1" = 7) AND ( "srtm@1">= 11)) * 1 + (("srtm@1"< 11)) * "cuba_2021_rfL8_rc1@1"
+cuba_2021_rfL8_rc2
+3. Pinares pixels <= 22 m above sea level become mangroves
+(("cuba_2021_rfL8_rc2@1" != 4) AND ( "srtm@1"<= 22)) * "cuba_2021_rfL8_rc2@1" + (("cuba_2021_rfL8_rc2@1" = 4) AND ( "srtm@1"<= 22)) * 3 + (("srtm@1" > 22)) * "cuba_2021_rfL8_rc2@1"
+cuba_2021_rfL8_rc3
+4. Agriculture land pixels <= 4 m above sea level become wetlands
+(("cuba_2021_rfL8_rc3@1" != 4) AND ( "srtm@1"<= 4)) * "cuba_2021_rfL8_rc3@1" + (("cuba_2021_rfL8_rc3@1" = 4) AND ( "srtm@1"<= 4)) * 7 + (("srtm@1" > 4)) * "cuba_2021_rfL8_rc3@1"
+cuba_2021_rfL8_rc4
+5. Water bodies pixels >= 300 m above sea level become forest
+(("cuba_2021_rfL8_rc4@1" != 6) AND ( "srtm@1" >= 300)) * "cuba_2021_rfL8_rc4@1" + (("cuba_2021_rfL8_rc4@1" = 6) AND ( "srtm@1" >= 300)) * 2 + (("srtm@1" < 300)) * "cuba_2021_rfL8_rc4@1"
+cuba_2021_rfL8_rc5
+
